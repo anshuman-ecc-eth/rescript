@@ -334,11 +334,19 @@ async function clearInput(ffmpeg: FFmpeg): Promise<void> {
   }
 }
 
-async function ensureInput(ffmpeg: FFmpeg, file: File): Promise<string> {
+async function ensureInput(
+  ffmpeg: FFmpeg,
+  file: File,
+  preferMount = false
+): Promise<string> {
   if (writtenFor === file) return inputPath;
   await clearInput(ffmpeg);
 
-  if (file.size > COPY_INPUT_MAX_BYTES) {
+  // `preferMount` skips the in-memory copy entirely. Export needs the heap for
+  // the output, and copying the input in would hold both the `fetchFile`
+  // ArrayBuffer and a MEMFS copy of it for the whole render — the difference
+  // between fitting and "Array buffer allocation failed" on a long clip.
+  if (preferMount || file.size > COPY_INPUT_MAX_BYTES) {
     try {
       inputPath = await mountInput(ffmpeg, file);
       writtenFor = file;
@@ -440,10 +448,93 @@ function scaleFilter(resolution: VideoExportResolution): string | null {
 }
 
 /**
- * Render the edited video: keep only `keepRanges` of the original media and
- * concatenate them. Re-encodes so cuts land exactly on word boundaries
- * rather than keyframes. `withAudio: false` renders a silent source, whose
- * missing [0:a] would otherwise fail the whole filtergraph.
+ * ffmpeg.wasm's worker replies to any failure inside the core with
+ * `error.toString()` — a plain string, not an `Error` (see the worker's
+ * `catch`). A core abort/OOM therefore reaches us as a bare string, and the
+ * Export dialog's `err instanceof Error` fallback collapses it to the generic
+ * "Export failed." with no clue what happened. Wrap non-Errors so the real
+ * cause is visible (and reaches Sentry) instead of being swallowed.
+ */
+function exportError(cause: unknown, fallbackMessage: string): Error {
+  if (cause instanceof Error) return cause;
+  const detail =
+    typeof cause === "string"
+      ? cause.trim()
+      : cause == null
+        ? ""
+        : String(cause).trim();
+  return new Error(detail ? `${fallbackMessage} (${detail})` : fallbackMessage);
+}
+
+/** Output is read back from MEMFS in chunks, so a long export never needs the whole file twice. */
+const READ_CHUNK_BYTES = 64 * 1024 * 1024;
+
+/**
+ * `readFileChunk` is added to the `FFmpeg` class by our @ffmpeg/ffmpeg patch;
+ * it is absent on an unpatched install, in which case we fall back to the
+ * package's all-at-once `readFile`.
+ */
+interface ChunkReadableFFmpeg extends FFmpeg {
+  readFileChunk?: (
+    path: string,
+    offset: number,
+    length: number
+  ) => Promise<Uint8Array>;
+}
+
+/**
+ * Read the finished `path` out of ffmpeg's in-memory FS into a Blob.
+ *
+ * `readFile` allocates a *second* full-size copy inside the worker and returns
+ * it in one piece; for a long 1080p export that copy is what overruns the
+ * worker's heap and rejects at the very end of a render. Chunked reads keep the
+ * peak at roughly the file plus one chunk, on both the worker and the main
+ * thread.
+ */
+async function readOutput(
+  ffmpeg: FFmpeg,
+  path: string,
+  mime: string
+): Promise<Blob> {
+  const chunked = ffmpeg as ChunkReadableFFmpeg;
+  if (!chunked.readFileChunk) {
+    const data = (await ffmpeg.readFile(path)) as Uint8Array;
+    return new Blob([data as unknown as BlobPart], { type: mime });
+  }
+  const parts: BlobPart[] = [];
+  for (let offset = 0; ; offset += READ_CHUNK_BYTES) {
+    const chunk = await chunked.readFileChunk(path, offset, READ_CHUNK_BYTES);
+    if (chunk.byteLength === 0) break;
+    parts.push(chunk as unknown as BlobPart);
+    if (chunk.byteLength < READ_CHUNK_BYTES) break;
+  }
+  return new Blob(parts, { type: mime });
+}
+
+/**
+ * Build the `select`/`aselect` expression that keeps only `keepRanges`.
+ *
+ * This replaces the old trim+concat graph, which created one filter pad per
+ * range and buffered a frame from each at once. On a long 1080p edit with many
+ * cuts that alone exhausted ffmpeg.wasm's ~2 GiB heap ("RuntimeError: memory
+ * access out of bounds" part-way through the render). `select` filters the
+ * single input stream in place — constant memory — and the caller re-times the
+ * survivors with `setpts` / `asetpts` so the result plays continuously.
+ *
+ * Callers must wrap the result in single quotes inside the filtergraph, or the
+ * commas inside `between(...)` are read as filter separators.
+ */
+export function keepRangesExpr(keepRanges: TimeRange[]): string {
+  return keepRanges
+    .map((r) => `between(t,${r.start.toFixed(3)},${r.end.toFixed(3)})`)
+    .join("+");
+}
+
+/**
+ * Render the edited video: keep only `keepRanges` of the original media, then
+ * re-encode so cuts land exactly on word boundaries rather than keyframes.
+ * `withAudio: false` renders a silent source, whose missing [0:a] would
+ * otherwise fail the whole filtergraph.
  */
 export async function exportVideo(
   file: File,
@@ -462,31 +553,21 @@ export async function exportVideo(
   // Growable heap: the MT core's fixed 1 GiB is what failed 1080p/original
   // exports (Discord: "ffmpeg not starting" in the desktop app; browser OK).
   const ffmpeg = await getFFmpeg(exportCoreKind());
-  const input = await ensureInput(ffmpeg, file);
+  const input = await ensureInput(ffmpeg, file, true);
   const out = format === "webm" ? "output.webm" : "output.mp4";
   const scale = scaleFilter(resolution);
 
-  const parts: string[] = [];
-  const labels: string[] = [];
-  keepRanges.forEach((r, i) => {
-    const s = r.start.toFixed(3);
-    const e = r.end.toFixed(3);
-    parts.push(`[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS[v${i}]`);
-    labels.push(`[v${i}]`);
-    if (withAudio) {
-      parts.push(`[0:a]atrim=start=${s}:end=${e},asetpts=PTS-STARTPTS[a${i}]`);
-      labels[labels.length - 1] += `[a${i}]`;
-    }
-  });
-  let filter =
-    parts.join(";") +
-    `;${labels.join("")}concat=n=${keepRanges.length}:v=1:a=${
-      withAudio ? 1 : 0
-    }[outv]${withAudio ? "[outa]" : ""}`;
-  const videoMap = scale ? "[vout]" : "[outv]";
-  if (scale) {
-    filter += `;[outv]${scale}[vout]`;
-  }
+  // One `select` over the source stream instead of a `trim` pad per range plus
+  // a giant `concat`. The trim/concat graph buffers a frame per cut at once,
+  // which is what overran the wasm heap; `select` re-times in place.
+  const expr = keepRangesExpr(keepRanges);
+  let vfilter = `[0:v]select='${expr}',setpts=N/FRAME_RATE/TB`;
+  if (scale) vfilter += `,${scale}`;
+  vfilter += "[vout]";
+  const filter = withAudio
+    ? `${vfilter};[0:a]aselect='${expr}',asetpts=N/SR/TB[outa]`
+    : vfilter;
+  const videoMap = "[vout]";
 
   const progressHandler = ({ time }: { progress: number; time: number }) => {
     // `time` is the output timestamp in microseconds.
@@ -513,29 +594,46 @@ export async function exportVideo(
             "-movflags", "+faststart",
           ];
 
-    const code = await execWithWatchdog(ffmpeg, [
-      "-i", input,
-      "-filter_complex", filter,
-      "-map", videoMap,
-      ...(withAudio ? ["-map", "[outa]"] : ["-an"]),
-      ...codecArgs,
-      "-y", out,
-    ]);
+    let code: number;
+    try {
+      code = await execWithWatchdog(ffmpeg, [
+        "-i", input,
+        "-filter_complex", filter,
+        "-map", videoMap,
+        ...(withAudio ? ["-map", "[outa]"] : ["-an"]),
+        ...codecArgs,
+        "-y", out,
+      ]);
+    } catch (err) {
+      // A core abort/OOM surfaces here as a bare string; keep it visible.
+      throw exportError(err, en["error.videoExport"]);
+    }
     if (code !== 0) throw new Error(en["error.videoExport"]);
-    const data = (await ffmpeg.readFile(out)) as Uint8Array;
+    let blob: Blob;
+    try {
+      blob = await readOutput(
+        ffmpeg,
+        out,
+        format === "webm" ? "video/webm" : "video/mp4"
+      );
+    } catch (err) {
+      throw exportError(err, en["error.videoExport"]);
+    }
     await ffmpeg.deleteFile(out);
-    const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-    return new Blob([buf as ArrayBuffer], {
-      type: format === "webm" ? "video/webm" : "video/mp4",
-    });
+    return blob;
   } finally {
     ffmpeg.off("progress", progressHandler);
+    // Drop the core after every export so its heap — wasm memory plus the
+    // output still held in MEMFS — returns before the next attempt. Without
+    // this, a retry starts with the previous run's growth still resident,
+    // which is the "worked once, then OOMs part-way" pattern.
+    await releaseFFmpeg();
   }
 }
 
 /**
- * Render an edited audio-only file: keep only `keepRanges` and concatenate
- * them. Works for both audio projects and the audio track of a video file.
+ * Render an edited audio-only file: keep only `keepRanges`. Works for both
+ * audio projects and the audio track of a video file.
  */
 export async function exportAudio(
   file: File,
@@ -548,21 +646,13 @@ export async function exportAudio(
     throw new Error(en["error.nothingToExport"]);
   }
   const ffmpeg = await getFFmpeg(exportCoreKind());
-  const input = await ensureInput(ffmpeg, file);
+  const input = await ensureInput(ffmpeg, file, true);
   const out =
     format === "mp3" ? "output.mp3" : format === "wav" ? "output.wav" : "output.m4a";
 
-  const parts: string[] = [];
-  const labels: string[] = [];
-  keepRanges.forEach((r, i) => {
-    const s = r.start.toFixed(3);
-    const e = r.end.toFixed(3);
-    parts.push(`[0:a]atrim=start=${s}:end=${e},asetpts=PTS-STARTPTS[a${i}]`);
-    labels.push(`[a${i}]`);
-  });
-  const filter =
-    parts.join(";") +
-    `;${labels.join("")}concat=n=${keepRanges.length}:v=0:a=1[outa]`;
+  // Same in-place `select` as exportVideo: no per-range pads to buffer.
+  const expr = keepRangesExpr(keepRanges);
+  const filter = `[0:a]aselect='${expr}',asetpts=N/SR/TB[outa]`;
 
   const progressHandler = ({ time }: { progress: number; time: number }) => {
     const ratio = Math.min(1, time / 1e6 / Math.max(0.001, editedDuration));
@@ -577,25 +667,41 @@ export async function exportAudio(
           ? ["-c:a", "pcm_s16le"]
           : ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"];
 
-    const code = await execWithWatchdog(ffmpeg, [
-      "-i", input,
-      "-filter_complex", filter,
-      "-map", "[outa]",
-      ...codecArgs,
-      "-y", out,
-    ]);
-    if (code !== 0) throw new Error(en["error.audioExport"]);
-    const data = (await ffmpeg.readFile(out)) as Uint8Array;
-    await ffmpeg.deleteFile(out);
-    const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     const mime =
       format === "mp3"
         ? "audio/mpeg"
         : format === "wav"
           ? "audio/wav"
           : "audio/mp4";
-    return new Blob([buf as ArrayBuffer], { type: mime });
+
+    let code: number;
+    try {
+      code = await execWithWatchdog(ffmpeg, [
+        "-i", input,
+        "-filter_complex", filter,
+        "-map", "[outa]",
+        ...codecArgs,
+        "-y", out,
+      ]);
+    } catch (err) {
+      // A core abort/OOM surfaces here as a bare string; keep it visible.
+      throw exportError(err, en["error.audioExport"]);
+    }
+    if (code !== 0) throw new Error(en["error.audioExport"]);
+    let blob: Blob;
+    try {
+      blob = await readOutput(ffmpeg, out, mime);
+    } catch (err) {
+      throw exportError(err, en["error.audioExport"]);
+    }
+    await ffmpeg.deleteFile(out);
+    return blob;
   } finally {
     ffmpeg.off("progress", progressHandler);
+    // Drop the core after every export so its heap — wasm memory plus the
+    // output still held in MEMFS — returns before the next attempt. Without
+    // this, a retry starts with the previous run's growth still resident,
+    // which is the "worked once, then OOMs part-way" pattern.
+    await releaseFFmpeg();
   }
 }

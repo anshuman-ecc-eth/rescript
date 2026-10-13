@@ -113,5 +113,17 @@ when the 1 GiB `SharedArrayBuffer` cannot be reserved. That is what made
 desktop-app 1080p/original export fail with "ffmpeg not starting" while the
 same project exported in the browser.
 
+**Follow-up (large outputs).** `readFile` returns the whole MEMFS file as a
+single `Uint8Array` — a second full-size copy inside the worker's JS heap. On a
+long 1080p export that copy overruns the worker and rejects at the very end of
+the render, and because the worker's `catch` posts `error.toString()`, the
+rejection is a bare string that the Export dialog's `instanceof Error` fallback
+collapsed to "Export failed." with no cause. The patch adds
+`readFileChunk(path, offset, length)` and teaches the worker's `readFile` to
+honour those via `FS.open`/`llseek`/`read`/`close`. `lib/ffmpeg.ts` then reads
+the finished output in 64 MiB chunks and assembles the Blob, so the peak is
+roughly the file plus one chunk on each thread rather than ~2x in the worker
+and ~3x on the main thread.
+
 **Upstreaming.** Worth a PR — this is a bug in any consumer, not something
 specific to Rescript.

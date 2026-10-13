@@ -1,5 +1,5 @@
 diff --git a/node_modules/@ffmpeg/ffmpeg/dist/esm/classes.js b/node_modules/@ffmpeg/ffmpeg/dist/esm/classes.js
-index fae4753..625b7f7 100644
+index fae4753..646f895 100644
 --- a/node_modules/@ffmpeg/ffmpeg/dist/esm/classes.js
 +++ b/node_modules/@ffmpeg/ffmpeg/dist/esm/classes.js
 @@ -20,11 +20,31 @@ export class FFmpeg {
@@ -34,3 +34,50 @@ index fae4753..625b7f7 100644
              this.#worker.onmessage = ({ data: { id, type, data }, }) => {
                  switch (type) {
                      case FFMessageType.LOAD:
+@@ -258,6 +278,17 @@ export class FFmpeg {
+         type: FFMessageType.READ_FILE,
+         data: { path, encoding },
+     }, undefined, signal);
++    /**
++     * Read a byte range of a file. Rescript addition (see patches/) so a large
++     * export can be streamed out in chunks instead of `readFile` materialising
++     * a second full-size copy of it inside the worker.
++     *
++     * @category File System
++     */
++    readFileChunk = (path, offset, length, { signal } = {}) => this.#send({
++        type: FFMessageType.READ_FILE,
++        data: { path, offset, length },
++    }, undefined, signal);
+     /**
+      * Delete a file.
+      *
+diff --git a/node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js b/node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js
+index cca2a61..810d2f4 100644
+--- a/node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js
++++ b/node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js
+@@ -57,7 +57,23 @@ const writeFile = ({ path, data }) => {
+     ffmpeg.FS.writeFile(path, data);
+     return true;
+ };
+-const readFile = ({ path, encoding }) => ffmpeg.FS.readFile(path, { encoding });
++const readFile = ({ path, encoding, offset, length }) => {
++    if (offset === undefined || length === undefined)
++        return ffmpeg.FS.readFile(path, { encoding });
++    // Rescript addition (see patches/): read a byte range so large exports can
++    // be streamed out in chunks instead of copying the whole file at once.
++    const stream = ffmpeg.FS.open(path, "r");
++    try {
++        if (offset > 0)
++            ffmpeg.FS.llseek(stream, offset, 0);
++        const chunk = new Uint8Array(length);
++        const read = ffmpeg.FS.read(stream, chunk, 0, length);
++        return read === length ? chunk : chunk.subarray(0, read);
++    }
++    finally {
++        ffmpeg.FS.close(stream);
++    }
++};
+ // TODO: check if deletion works.
+ const deleteFile = ({ path }) => {
+     ffmpeg.FS.unlink(path);

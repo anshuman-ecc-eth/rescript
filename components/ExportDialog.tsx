@@ -252,8 +252,18 @@ export default function ExportDialog() {
       // rendering the video" says nothing about which of ffmpeg's failure modes
       // it was. Send the original so the export path is visible in Sentry at
       // all; until now only the crashes that escaped this catch were.
+      // Log the raw value too: without a DSN (local dev) Sentry is inert, and a
+      // non-Error (ffmpeg's worker posts a bare string) would otherwise be
+      // reduced to the generic fallback with the cause lost.
+      console.error("[export] failed", err);
       reportError(err, `export-${activeTab}`);
-      setError(err instanceof Error ? err.message : en["error.export"]);
+      setError(
+        err instanceof Error
+          ? err.message
+          : typeof err === "string" && err.trim()
+            ? err
+            : en["error.export"]
+      );
     } finally {
       setStatus("ready");
     }

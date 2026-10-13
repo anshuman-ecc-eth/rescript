@@ -7,11 +7,12 @@
  * OOM mid-encode. `@ffmpeg/core` grows 32 MiB → 2 GiB and is what export
  * selects; copy-assets must ship both binaries.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   coreAssetBase,
   exportCoreKind,
+  keepRangesExpr,
   type FFmpegCoreKind,
 } from "../lib/ffmpeg";
 
@@ -50,6 +51,39 @@ function main() {
       );
     }
   }
+
+  // Large exports are read back from MEMFS in 64 MiB chunks (lib/ffmpeg.ts
+  // readOutput) instead of one full-size `readFile` copy, which is what a long
+  // 1080p render overran the worker with. Both halves of the @ffmpeg/ffmpeg
+  // patch have to be present and copied to public/ for that path to engage.
+  const classDir = join(root, "public/vendor/ffmpeg-class");
+  const workerSrc = readFileSync(join(classDir, "worker.js"), "utf8");
+  assert(
+    workerSrc.includes("offset === undefined") &&
+      workerSrc.includes('FS.open(path, "r")'),
+    "vendored worker must support chunked readFile (patches/ + copy-assets)"
+  );
+  const classSrc = readFileSync(join(classDir, "classes.js"), "utf8");
+  assert(
+    classSrc.includes("readFileChunk"),
+    "vendored FFmpeg class must expose readFileChunk"
+  );
+
+  // Export keeps ranges via a single streaming `select` rather than a trim pad
+  // per range + a giant `concat` (which buffered a frame per cut and OOM'd the
+  // wasm heap). The expression has to stay one quoted filter argument: its
+  // commas are inside between(...) and must not be read as filter separators.
+  assert(
+    keepRangesExpr([{ start: 1.25, end: 3.75 }]) === "between(t,1.250,3.750)",
+    "keepRangesExpr formats one range"
+  );
+  assert(
+    keepRangesExpr([
+      { start: 1.25, end: 3.75 },
+      { start: 10, end: 13.25 },
+    ]) === "between(t,1.250,3.750)+between(t,10.000,13.250)",
+    "keepRangesExpr joins ranges with +"
+  );
 
   console.log("ALL FFMPEG CORE TESTS PASSED");
 }

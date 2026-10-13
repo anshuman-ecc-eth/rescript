@@ -5,13 +5,13 @@ import type { ManualCut, TimeRange, Word } from "./types";
  * Minimum gap length (seconds) that counts as a removable silence.
  * Shorter gaps are normal inter-word spacing from ASR and should stay.
  */
-export const MIN_SILENCE_DURATION = 0.3;
+export const MIN_SILENCE_DURATION = 0.75;
 
 /**
  * Leave this much audio (seconds) beside kept speech so word onsets/offsets
  * aren't clipped when Whisper timestamps are slightly tight.
  */
-export const SILENCE_PAD = 0.05;
+export const SILENCE_PAD = 0.15;
 
 /**
  * Manual cuts that hold no words at all — what "Remove silences" leaves behind
